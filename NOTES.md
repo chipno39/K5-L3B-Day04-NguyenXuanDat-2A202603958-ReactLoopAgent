@@ -137,3 +137,26 @@ Cả hai lần chạy đều giữ nguyên cùng cấu hình trong khối `confi
    - Tool `get_incident_details` chỉ giữ lại 2 cập nhật mới nhất và 1 cập nhật đầu tiên, đồng thời cắt chuỗi ở **900 ký tự** (`truncated: true`), nên các chi tiết trung gian trong dòng thời gian dài có thể bị lược bỏ.
 3. **Giới hạn của việc chỉ chạy một lần mỗi phiên bản (`N = 1`):**
    - Việc sinh văn bản và gọi tool của LLM có tính bất định (non-deterministic). Chỉ chạy 1 lần cho `eval_before.json` và 1 lần cho `eval_after.json` chưa đủ ý nghĩa thống kê để kết luận độ ổn định tuyệt đối của hệ thống trong môi trường production; để đánh giá độ tin cậy thực tế cần chạy lặp nhiều lần (`pass@k`) và kiểm thử với dữ liệu live đa dạng hơn.
+
+## 6. Thử thách Bonus (+15 điểm: 5 Providers, Retry, Pagination & Context)
+
+### 6.1. Thiết kế mở rộng trong `agent.py`
+1. **Kết nối động bộ tools Bonus:**
+   - Sử dụng `schemas = getattr(tools, 'schemas', SCHEMAS)` và `getattr(tools, 'system_prompt', None)` để tương thích hoàn toàn với cả `StatusTools` (2 tools bài chính) lẫn `BonusTools` (6 tools: `get_github_status`, `get_cloudflare_status`, `get_vercel_status`, `get_npm_status`, `get_digitalocean_status`, và `get_incident_details` có phân trang).
+   - Khi phát hiện `tools.system_prompt`, agent bổ sung các quy tắc điều phối `BONUS_PROMPT_ADDON` và tách biệt rõ `<system_instructions>` với `<user_question>`.
+2. **Xử lý lỗi `RATE_LIMITED` (HTTP 429) và `INVALID_ARGUMENTS`:**
+   - Agent theo dõi số lần gọi mỗi tool qua `tool_call_counts`. Khi tool trả về `error: "RATE_LIMITED"` (429), lỗi được gửi lại làm observation để model retry ở bước kế tiếp mà không coi 429 là outage dịch vụ (`B3`, `B10`).
+   - Khi một tool đã được gọi tới lần thứ 3 mà vẫn trả về `RATE_LIMITED` (`tool_call_counts[name] >= 3`, như kịch bản `rate_limit_always` ở `B4`), agent gắn cờ `retry_limit_reached: True` và thông báo yêu cầu model dừng gọi lại tool đó để không vượt trần `max_calls = 3`, đồng thời báo cáo trung thực phần dịch vụ không kiểm tra được.
+   - Khi gặp `INVALID_ARGUMENTS` (như kịch bản `format_once` ở `B5`), observation hướng dẫn model gọi lại `get_incident_details` ở bước kế tiếp với tham số kiểu số nguyên hợp lệ (`offset=0, limit=2`).
+3. **Phân trang Timeline (`Pagination` — `B2`):**
+   - Khi truy vấn timeline dài (như sự cố `sps6n39gm4sg` của Vercel có `total_updates = 7`), model gọi trang đầu (`offset=0`), kiểm tra `next_offset` và tiếp tục gọi `get_incident_details` với `offset=next_offset` ở bước tiếp theo cho đến khi tìm thấy update lúc `2026-10-12T16:10:48.923Z` nhắc tới sự cố upstream GitHub (`93njd414rpbx`).
+4. **Lọc dữ liệu nhiễu lớn (`Context Management` — `B6`) & Kiểm tra đa nguồn (`B6`, `B8`):**
+   - Trong `trace`, kết quả gốc `tool_result` vẫn được giữ nguyên vẹn; nhưng trước khi đưa vào `messages` gửi cho LLM, nếu `tool_result` chứa mảng `distractors` (160 bản ghi nhiễu giả lập ở `B6`), agent lược bỏ mảng `distractors` khỏi payload ngữ cảnh và chỉ giữ `distractors_filtered: 160`. Nhờ đó tiết kiệm hàng nghìn token nhiễu và giúp model tập trung gọi tiếp `get_incident_details` cho cả 2 sự cố mới nhất (`w661l7k3kf4p` và `cc0t2r4403sy`).
+   - Cổng `validation_missing_source` kiểm tra toàn bộ danh sách `missing_urls = [url for url in observed_incident_urls if url not in last_answer]`, đảm bảo khi kiểm tra nhiều incident (`B6`, `B8`), mọi URL nguồn đều phải có mặt trong câu trả lời cuối.
+
+### 6.2. Kết quả chạy `eval_bonus.json`
+- **Cấu hình:** `provider = "gemini"`, `model = "gemini-3.5-flash-lite"`, `judge_model = "gemini-3.5-flash-lite"`, `max_steps = 16`, `dataset = "bonus"`.
+- **Điểm số:** **100.0 / 100** (**10/10 cases `B1`–`B10` đạt tuyệt đối 100/100 điểm**).
+- **Điểm quy đổi Bonus (`bonus_points_0_15`):** **15.0 / 15 điểm**.
+- **Chi phí & Số bước:** 28 agent model calls (65,552 agent tokens) + 10 judge calls (30,637 judge tokens).
+- **Giới hạn còn lại:** Cơ chế lọc `distractors` hiện dựa trên key cấu trúc (`distractors`); nếu dữ liệu nhiễu ngoài thực tế nằm lẫn trực tiếp trong mảng `incidents` thật dưới dạng các sự cố lịch sử không liên quan, agent vẫn cần dựa vào khả năng đọc hiểu của LLM và bộ lọc chuỗi `component` để chọn đúng incident.
